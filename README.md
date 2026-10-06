@@ -1,4 +1,4 @@
-# 🔥 Smart Reflow Plate Controller (ESP8266 NodeMCU)
+# Smart Reflow Plate Controller (ESP8266 NodeMCU)
 
 Профессиональный контроллер нагревательного столика для пайки SMD-компонентов на базе **NodeMCU (ESP8266)** с Wi-Fi, Web-интерфейсом, OLED-дисплеем и профилями JEDEC.
 
