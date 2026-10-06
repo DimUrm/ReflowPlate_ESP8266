@@ -1,0 +1,6 @@
+Reflow Plate Firmware Release
+Version: v2.4.6
+Build Date: 2026-10-05 17:59:03
+------------------------------------------
+Binary ready for Web OTA upload:
+File: releases\firmware_v2.4.6.bin
