@@ -22,7 +22,6 @@ uint8_t pcf_output_byte = 0x00;
 bool fan_manual = false;
 bool fan_active = false;
 
-// Предварительное объявление проверки I2C
 bool i2cPresent(uint8_t a);
 
 void pcfWritePin(uint8_t pin, bool state) {
@@ -30,7 +29,6 @@ void pcfWritePin(uint8_t pin, bool state) {
   if (state) pcf_output_byte |= (1 << pin);
   else pcf_output_byte &= ~(1 << pin);
 
-  // Пины кнопок (P2, P3) всегда должны иметь '1' в выходном регистре для работы подтяжки на вход
   pcf_output_byte |= (1 << PCF_PIN_BTN_BACK) | (1 << PCF_PIN_BTN_CONF);
 
   Wire.beginTransmission(pcf_address);
@@ -53,7 +51,6 @@ bool initPCF8574() {
     if (i2cPresent(a)) {
       pcf_address = a;
       pcf_found = true;
-      // Включаем подтяжку '1' на пинах кнопок (P2 и P3), выходы P0/P1 гасим в 0
       pcf_output_byte = (1 << PCF_PIN_BTN_BACK) | (1 << PCF_PIN_BTN_CONF);
       Wire.beginTransmission(pcf_address);
       Wire.write(pcf_output_byte);
@@ -64,18 +61,16 @@ bool initPCF8574() {
   return false;
 }
 
-// Создание экземпляров классов
+// ================= ОБЪЕКТЫ И ПЕРЕМЕННЫЕ =================
 BuzzerEngine buzzer;
 ProfileEngine profile;
 
-// Переменные системы Auto-Sleep / Standby
-uint32_t last_activity_time = 0;       // Время последнего действия пользователя
-uint32_t standby_timeout_min = 10;     // Минут до перехода в Standby (0 = выключено)
+uint32_t last_activity_time = 0;
+uint32_t standby_timeout_min = 10;
 StandbyMode standby_state = STBY_ACTIVE;
-float pre_standby_target = 150.0f;     // Запоминаем уставку перед сном
-bool oled_sleeping = false; // Флаг: спит ли экран
+float pre_standby_target = 150.0f;
+bool oled_sleeping = false;
 
-// Переменные PID Auto-Tune (Метод релейной обратной связи)
 TuneState tune_state = TUNE_OFF;
 uint8_t   tune_cycles = 0;
 uint32_t  tune_t1 = 0, tune_t2 = 0;
@@ -83,11 +78,10 @@ float     tune_t_low = 0, tune_t_high = 0;
 bool      tune_relay_high = false;
 float     tune_target = 150.0f;
 
-// Статистика и учет энергии
-float    session_wh = 0.0f;          // Потребленная энергия за текущую сессию (Ватт-часы)
-uint32_t session_heat_sec = 0;       // Время активного нагрева за сессию (сек)
-uint32_t lifetime_heat_min = 0;      // Общие моточасы ТЭНа за всё время (минуты, сохраняются в флеш)
-uint32_t reflow_cycles_count = 0;    // Количество успешно проведенных циклов пайки
+float    session_wh = 0.0f;
+uint32_t session_heat_sec = 0;
+uint32_t lifetime_heat_min = 0;
+uint32_t reflow_cycles_count = 0;
 uint32_t last_energy_calc = 0;
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
@@ -96,7 +90,6 @@ AsyncWebSocket ws("/ws");
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// Конфигурация и переменные состояния
 char wifi_ssid[33] = "", wifi_pass[65] = "", web_pin[33] = "";
 char mqtt_server[64] = "192.168.1.100", mqtt_user[32] = "", mqtt_pass[32] = "";
 char mqtt_topic[64] = "home/reflow_plate";
@@ -124,6 +117,9 @@ volatile int enc_delta = 0;
 
 bool cfg_save = false, apply_sensor = false, mqtt_reconf = true, forceTele = true;
 uint32_t restart_at = 0;
+bool wifi_scan_running = false;
+
+void drawOled();
 
 void IRAM_ATTR isrEncoder() {
   static uint32_t last = 0;
@@ -133,7 +129,23 @@ void IRAM_ATTR isrEncoder() {
   if (digitalRead(PIN_ENC_DT)) enc_delta++; else enc_delta--;
 }
 
-// ================= РАБОТА С ФАЙЛОМ PROFILES.JSON =================
+void resetActivityTimer() {
+  last_activity_time = millis();
+  if (oled_sleeping && oled_ok) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    oled_sleeping = false;
+    drawOled();
+    forceTele = true;
+  }
+  if (standby_state == STBY_STANDBY) {
+    standby_state = STBY_ACTIVE;
+    target_temp = pre_standby_target;
+    buzzer.play(SND_CLICK);
+    forceTele = true;
+  }
+}
+
+// ================= ФАЙЛ PROFILES.JSON =================
 void createDefaultProfiles() {
   File f = LittleFS.open("/profiles.json", "w");
   if (!f) return;
@@ -145,7 +157,7 @@ void createDefaultProfiles() {
   "]";
   f.print(def_json);
   f.close();
-  Serial.println("[FS] Created default /profiles.json");
+  Serial.println(F("[FS] Created default /profiles.json"));
 }
 
 void loadProfiles() {
@@ -159,7 +171,7 @@ void loadProfiles() {
   f.close();
 
   if (err) {
-    Serial.println("[FS] profiles.json corrupted, recreating defaults...");
+    Serial.println(F("[FS] profiles.json corrupted, recreating defaults..."));
     createDefaultProfiles();
     return;
   }
@@ -175,7 +187,7 @@ void loadProfiles() {
     profile.list[i].reflow   = obj["ref"] | 215.0f;
     profile.list[i].reflow_t = obj["ref_t"] | 25;
   }
-  Serial.println("[FS] 4 Profiles loaded from /profiles.json");
+  Serial.println(F("[FS] 4 Profiles loaded from /profiles.json"));
 }
 
 void saveProfiles() {
@@ -196,7 +208,7 @@ void saveProfiles() {
   }
   serializeJson(doc, f);
   f.close();
-  Serial.println("[FS] Profiles saved to LittleFS");
+  Serial.println(F("[FS] Profiles saved to LittleFS"));
 }
 
 void loadConfig() {
@@ -237,21 +249,6 @@ void saveConfig() {
   d["stby_m"] = standby_timeout_min;
   d["tot_m"]  = lifetime_heat_min;
   d["r_cyc"]  = reflow_cycles_count;
-  // Передаем 4 профиля в браузер
-  JsonArray prof_arr = d.createNestedArray("profiles");
-  for (uint8_t i = 0; i < 4; i++) {
-    JsonObject p = prof_arr.createNestedObject();
-    p["id"]     = i;
-    p["name"]   = profile.list[i].name;
-    p["desc"]   = profile.list[i].desc;
-    p["pre"]    = (int)profile.list[i].preheat;
-    p["soak"]   = (int)profile.list[i].soak;
-    p["soak_t"] = profile.list[i].soak_t;
-    p["ref"]    = (int)profile.list[i].reflow;
-    p["ref_t"]  = profile.list[i].reflow_t;
-  }
-
-  String out;
   serializeJson(d, f);
   f.close();
 }
@@ -261,6 +258,7 @@ void setSecret(char* dst, size_t n, const char* in) {
   if (strcmp(in, "-") == 0) dst[0] = 0; else strlcpy(dst, in, n);
 }
 
+// ================= ДАТЧИКИ =================
 uint16_t maxRaw() {
   digitalWrite(PIN_MAX_CS, LOW);
   delayMicroseconds(10);
@@ -334,11 +332,11 @@ void stopHeating() {
   is_heating = false; 
   output_power = 0; 
   profile.stop();
-  tune_state = TUNE_OFF;
+  if (tune_state != TUNE_DONE) tune_state = TUNE_OFF;
   pidReset(); 
 }
 
-// ================= ДВИЖОК PID AUTO-TUNE =================
+// ================= АВТОТЮН С ИСПРАВЛЕННОЙ МАТЕМАТИКОЙ =================
 void startAutoTune() {
   if (fault != F_NONE || !temp_valid) return;
   stopHeating();
@@ -350,6 +348,7 @@ void startAutoTune() {
   tune_t_high = 0.0f;
   tune_relay_high = true;
   tune_t1 = millis();
+  heat_start = millis(); // ИСПРАВЛЕНИЕ: Сбрасываем heat_start, чтобы не было моментального TIMEOUT!
   is_heating = true;
   output_power = 100.0f;
   strlcpy(profile.name, "Tune", sizeof(profile.name));
@@ -360,46 +359,45 @@ void startAutoTune() {
 void runAutoTune(uint32_t now) {
   if (tune_state != TUNE_RUNNING) return;
 
-  // Фиксируем пики экстремумов волны
   if (temp_f > tune_t_high) tune_t_high = temp_f;
   if (temp_f < tune_t_low)  tune_t_low  = temp_f;
 
-  // Релейное переключение мощности (100% или 0%)
   if (tune_relay_high && temp_f >= tune_target) {
     tune_relay_high = false;
-    output_power = 0.0f; // Перевалили за 150°C -> глушим ТЭН
+    output_power = 0.0f;
   } 
   else if (!tune_relay_high && temp_f <= tune_target) {
     tune_relay_high = true;
-    output_power = 100.0f; // Упали ниже 150°C -> жарим на 100%
+    output_power = 100.0f;
     tune_cycles++;
 
     if (tune_cycles == 1) {
-      tune_t1 = now; // Отсечка старта стабильной волны
+      tune_t1 = now;
       tune_t_high = temp_f;
       tune_t_low = temp_f;
     } 
-    else if (tune_cycles >= 4) { // Сделали 3 полных периода колебаний!
+    else if (tune_cycles >= 4) {
       tune_t2 = now;
-      float pu = ((tune_t2 - tune_t1) / 3000.0f);          // Период колебаний (сек)
-      float a  = (tune_t_high - tune_t_low) / 2.0f;        // Амплитуда перелета (°C)
-      if (a < 1.0f) a = 1.0f;
+      float pu = ((tune_t2 - tune_t1) / 3000.0f);
+      float a  = (tune_t_high - tune_t_low) / 2.0f;
+      if (a < 0.5f) a = 0.5f;
 
-      // Формулы Циглера-Никольса для ПИД:
-      float ku = (4.0f * 100.0f) / (3.14159f * a);        // Предельный коэффициент
+      // ИСПРАВЛЕНИЕ: d = 50% амплитуды реле, числитель 200 вместо 400!
+      float ku = (4.0f * 50.0f) / (3.14159265f * a);
       Kp = 0.6f * ku;
       Ki = 1.2f * ku / pu;
       Kd = 0.075f * ku * pu;
 
-      // Ограничиваем адекватными пределами
       Kp = constrain(Kp, 0.5f, 50.0f);
       Ki = constrain(Ki, 0.001f, 1.0f);
       Kd = constrain(Kd, 1.0f, 200.0f);
 
       tune_state = TUNE_DONE;
-      stopHeating();
-      cfg_save = true; // Сохраняем идеальный ПИД в память!
-      buzzer.play(SND_COMPLETE); // Победный сигнал!
+      is_heating = false;
+      output_power = 0.0f;
+      pidReset();
+      cfg_save = true;
+      buzzer.play(SND_COMPLETE);
       forceTele = true;
     }
   }
@@ -418,7 +416,9 @@ bool startHeating() {
   if (fault != F_NONE || !temp_valid) return false;
   pidReset();
   is_heating = true;
+  standby_state = STBY_ACTIVE; // ИСПРАВЛЕНИЕ: Сбрасываем standby_state в активное состояние
   heat_start = millis();
+  resetActivityTimer();        // ИСПРАВЛЕНИЕ: Будим дисплей
   buzzer.play(SND_CLICK);
   return true;
 }
@@ -467,31 +467,37 @@ void controlTick(uint32_t now) {
   if (!filter_init) { temp_f = raw; temp_prev = raw; rate_f = 0; filter_init = true; }
   else { temp_prev = temp_f; temp_f += 0.35f * (raw - temp_f); }
 
-if (raw > limitTemp()) tripFault(F_OVERTEMP);
+  // ИСПРАВЛЕНИЕ: Защиты работают ВСЕГДА, в том числе при автотюне!
+  if (raw > limitTemp()) tripFault(F_OVERTEMP);
   if (is_heating && now - heat_start > HEAT_MAX_MS) tripFault(F_TIMEOUT);
 
-  // Если запущен автотюн — работает его алгоритм
-  if (tune_state == TUNE_RUNNING) {
-    runAutoTune(now);
-    return; // Обычный ПИД не нужен, пока идет автокалибровка!
+  // Контроль срыва нагрева (NO HEATING) — теперь работает и при автотюне
+  if (output_power >= 90.0f && is_heating) {
+    if (!nr_active) { nr_active = true; nr_start = now; nr_temp = temp_f; }
+    else if (temp_f - nr_temp >= NO_RISE_DT) { nr_start = now; nr_temp = temp_f; }
+    else if (now - nr_start > NO_RISE_MS) tripFault(F_NO_RISE);
+  } else {
+    nr_active = false;
   }
 
-  // Обслуживание профиля с запросом на охлаждение
+  if (tune_state == TUNE_RUNNING) {
+    runAutoTune(now);
+    return;
+  }
+
   bool auto_fan = false;
   ReflowPhase prev_phase = profile.current_phase;
   profile.tick(now, temp_f, target_temp, is_heating, auto_fan);
 
-  // Если фаза REFLOW успешно завершилась и перешла в COOLDOWN -> засчитываем цикл пайки!
   if (prev_phase == PHASE_REFLOW && profile.current_phase == PHASE_COOLDOWN) {
     reflow_cycles_count++;
-    cfg_save = true; // Запоминаем в память
+    cfg_save = true;
   }
 
-  // Вентилятор активен, если включен кнопкой вручную ИЛИ идет фаза Cooldown
   fan_active = fan_manual || auto_fan;
   pcfWritePin(PCF_PIN_FAN, fan_active);
 
-  // Проверка бездействия в ручном режиме
+  // ИСПРАВЛЕНИЕ: Standby не поднимает уставку, если она уже ниже STANDBY_TEMP
   if (is_heating && !profile.is_active && standby_timeout_min > 0) {
     uint32_t idle_ms = now - last_activity_time;
     uint32_t t_standby = standby_timeout_min * 60UL * 1000UL;
@@ -500,7 +506,7 @@ if (raw > limitTemp()) tripFault(F_OVERTEMP);
     if (standby_state == STBY_ACTIVE && idle_ms >= t_standby) {
       standby_state = STBY_STANDBY;
       pre_standby_target = target_temp;
-      target_temp = STANDBY_TEMP;
+      target_temp = (target_temp > STANDBY_TEMP) ? STANDBY_TEMP : max(40.0f, target_temp - 20.0f);
       buzzer.play(SND_REFLOW_START);
       forceTele = true;
     } else if (standby_state == STBY_STANDBY && idle_ms >= t_off) {
@@ -520,14 +526,8 @@ if (raw > limitTemp()) tripFault(F_OVERTEMP);
     PID_D = -Kd * rate_f;
     float u = PID_P + PID_I + PID_D;
     output_power = u < 0 ? 0 : (u > 100 ? 100 : u);
-
-    if (output_power >= 90.0f) {
-      if (!nr_active) { nr_active = true; nr_start = now; nr_temp = temp_f; }
-      else if (temp_f - nr_temp >= NO_RISE_DT) { nr_start = now; nr_temp = temp_f; }
-      else if (now - nr_start > NO_RISE_MS) tripFault(F_NO_RISE);
-    } else nr_active = false;
   } else {
-    output_power = 0; PID_P = 0; PID_D = 0; nr_active = false;
+    output_power = 0; PID_P = 0; PID_D = 0;
   }
 }
 
@@ -539,26 +539,10 @@ void updateSSR(uint32_t now) {
   digitalWrite(PIN_SSR, (on && sensor != SN_SIM) ? HIGH : LOW);
 }
 
-void resetActivityTimer() {
-  last_activity_time = millis();
-  
-  // Если экран спал — зажигаем его обратно!
-  if (oled_sleeping && oled_ok) {
-    display.ssd1306_command(SSD1306_DISPLAYON);
-    oled_sleeping = false;
-  }
-
-  if (standby_state == STBY_STANDBY) {
-    standby_state = STBY_ACTIVE;
-    target_temp = pre_standby_target;
-    buzzer.play(SND_CLICK);
-    forceTele = true;
-  }
-}
-
 void pollInputs(uint32_t now) {
   noInterrupts(); int d = enc_delta; enc_delta = 0; interrupts();
   if (d) { 
+    resetActivityTimer();
     if (profile.is_active) stopHeating();
     setTarget(target_temp + d * 5); 
     strlcpy(profile.name, "Manual", sizeof(profile.name));
@@ -572,6 +556,7 @@ void pollInputs(uint32_t now) {
   if (now - t0 > 40 && r != stable) {
     stable = r;
     if (stable == LOW) {
+      resetActivityTimer(); // ИСПРАВЛЕНИЕ: Кнопка энкодера будит плату
       buzzer.play(SND_CLICK);
       if (fault != F_NONE) fault = F_NONE;
       else if (is_heating) stopHeating();
@@ -580,7 +565,6 @@ void pollInputs(uint32_t now) {
     }
   }
 
-  // --- Опрос кнопок Back и Confirm через PCF8574 (каждые 60 мс) ---
   static uint32_t pcf_poll_timer = 0;
   static bool last_btn_back = HIGH, last_btn_conf = HIGH;
 
@@ -591,33 +575,34 @@ void pollInputs(uint32_t now) {
     bool btn_back = (pcf_data & (1 << PCF_PIN_BTN_BACK)) ? HIGH : LOW;
     bool btn_conf = (pcf_data & (1 << PCF_PIN_BTN_CONF)) ? HIGH : LOW;
 
-    // Нажатие кнопки BACK (P2)
     if (btn_back == LOW && last_btn_back == HIGH) {
       resetActivityTimer();
       buzzer.play(SND_CLICK);
       if (fault != F_NONE) {
-        fault = F_NONE; // Сброс аварии
+        fault = F_NONE;
       } else if (is_heating) {
         stopHeating();
-        fan_manual = true; // Выключили ТЭН и включили вентилятор обдува!
+        fan_manual = true;
       } else {
-        fan_manual = !fan_manual; // Ручной тумблер обдува
+        fan_manual = !fan_manual;
       }
       forceTele = true;
     }
     last_btn_back = btn_back;
 
-    // Нажатие кнопки CONFIRM (P3): смена профилей из файла profiles.json по кругу
+    // ИСПРАВЛЕНИЕ: Кнопка Confirm не дает скачков на 235°C во время нагрева!
     if (btn_conf == LOW && last_btn_conf == HIGH) {
       resetActivityTimer();
-      buzzer.play(SND_CLICK);
-      if (profile.is_active) stopHeating();
-
-      static uint8_t preset_cycle = 0;
-      preset_cycle = (preset_cycle + 1) % 4;
-      setTarget(profile.list[preset_cycle].reflow);
-      strlcpy(profile.name, profile.list[preset_cycle].name, sizeof(profile.name));
-      forceTele = true;
+      if (is_heating || profile.is_active) {
+        buzzer.play(SND_FAULT); // Запрещено переключать при активном нагреве
+      } else {
+        buzzer.play(SND_CLICK);
+        static uint8_t preset_cycle = 0;
+        preset_cycle = (preset_cycle + 1) % 4;
+        setTarget(profile.list[preset_cycle].preheat); // Ставим преднагрев, а не пик!
+        strlcpy(profile.name, profile.list[preset_cycle].name, sizeof(profile.name));
+        forceTele = true;
+      }
     }
     last_btn_conf = btn_conf;
   }
@@ -640,10 +625,9 @@ bool initOled() {
 }
 
 void drawOled() {
-  if (!oled_ok) return;
+  if (!oled_ok || oled_sleeping) return;
   display.clearDisplay();
 
-  // 1. Верхняя строка: Сеть слева, значок Mute справа
   display.setTextSize(1);
   display.setCursor(2, 2);
   if (WiFi.status() == WL_CONNECTED) display.print(WiFi.localIP());
@@ -654,29 +638,25 @@ void drawOled() {
     display.print("[M]");
   }
 
-  // Тонкая разделительная линия сверху
   display.drawFastHLine(0, 11, 128, SSD1306_WHITE);
 
-  // 2. Вторая строка: Статус / Профиль (ЦЕНТРИРУЕМ)
   char status_str[24];
   if (fault != F_NONE) {
     snprintf(status_str, sizeof(status_str), "FAULT: %s", FAULT_NAMES[fault]);
   } else if (tune_state == TUNE_RUNNING) {
     snprintf(status_str, sizeof(status_str), "TUNE: Cyc %d/3", tune_cycles);
   } else if (standby_state == STBY_STANDBY) {
-    snprintf(status_str, sizeof(status_str), "ZZZ [STANDBY 100C]");
+    snprintf(status_str, sizeof(status_str), "ZZZ [STANDBY]");
   } else {
     if (profile.is_active) snprintf(status_str, sizeof(status_str), "%s: %s", profile.name, PHASE_NAMES[profile.current_phase]);
     else snprintf(status_str, sizeof(status_str), "%s [%s]", is_heating ? "HEAT" : "IDLE", profile.name);
   }
   
-  // Авто-центровка текста: (128 - длина_в_пикселях) / 2
   int16_t status_x = (128 - (strlen(status_str) * 6)) / 2;
   if (status_x < 0) status_x = 0;
   display.setCursor(status_x, 14);
   display.print(status_str);
 
-  // 3. Главная цифра: ТЕМПЕРАТУРА (ОГРОМНЫЙ ШРИФТ, СТРОГО ПО ЦЕНТРУ!)
   char temp_str[16];
   if (temp_valid) {
     snprintf(temp_str, sizeof(temp_str), "%.1f%cC", temp_f, (char)247);
@@ -685,16 +665,13 @@ void drawOled() {
   }
 
   display.setTextSize(2);
-  // Длина символа при размере 2 = 12 пикселей
   int16_t temp_x = (128 - (strlen(temp_str) * 12)) / 2;
   if (temp_x < 0) temp_x = 0;
   display.setCursor(temp_x, 26);
   display.print(temp_str);
 
-  // Тонкая разделительная линия снизу
   display.drawFastHLine(0, 44, 128, SSD1306_WHITE);
 
-  // 4. Подвал (Строка 1): Уставка слева, Мощность справа
   display.setTextSize(1);
   display.setCursor(4, 46);
   display.printf("Set:%d%cC", (int)target_temp, (char)247);
@@ -702,7 +679,6 @@ void drawOled() {
   display.setCursor(76, 46);
   display.printf("Pwr:%d%%", (int)output_power);
 
-  // 5. Подвал (Строка 2): Реле, Вентилятор и SIM-режим
   display.setCursor(4, 56);
   display.print(ssr_on ? "SSR: ON" : "SSR: off");
 
@@ -718,8 +694,9 @@ void drawOled() {
   display.display();
 }
 
+// ИСПРАВЛЕНИЕ: Документ на 2048 байт, профили передаются клиенту здесь
 void sendConfig(AsyncWebSocketClient *c) {
-  DynamicJsonDocument d(1024);
+  DynamicJsonDocument d(2048);
   d["type"] = "config";
   d["ssid"] = wifi_ssid;
   d["mq_en"] = mqtt_enabled; d["mq_srv"] = mqtt_server; d["mq_prt"] = mqtt_port;
@@ -730,6 +707,20 @@ void sendConfig(AsyncWebSocketClient *c) {
   d["stby_m"] = standby_timeout_min;
   d["tot_m"] = lifetime_heat_min;
   d["r_cyc"] = reflow_cycles_count;
+
+  JsonArray prof_arr = d.createNestedArray("profiles");
+  for (uint8_t i = 0; i < 4; i++) {
+    JsonObject p = prof_arr.createNestedObject();
+    p["id"]     = i;
+    p["name"]   = profile.list[i].name;
+    p["desc"]   = profile.list[i].desc;
+    p["pre"]    = (int)profile.list[i].preheat;
+    p["soak"]   = (int)profile.list[i].soak;
+    p["soak_t"] = profile.list[i].soak_t;
+    p["ref"]    = (int)profile.list[i].reflow;
+    p["ref_t"]  = profile.list[i].reflow_t;
+  }
+
   String out;
   serializeJson(d, out);
   c->text(out);
@@ -744,7 +735,10 @@ void sendTelemetry() {
   char buf[384];
   bool w_ok = (WiFi.status() == WL_CONNECTED);
   
-  // Пакет 1: Быстрая телеметрия управления (Температура, ПИД, Фазы)
+  // ИСПРАВЛЕНИЕ: Экранируем кавычки в имени SSID
+  String safe_ssid = w_ok ? WiFi.SSID() : "";
+  safe_ssid.replace("\"", "\\\"");
+
   snprintf(buf, sizeof(buf),
     "{\"type\":\"t\",\"t\":%.2f,\"g\":%.0f,\"p\":%.0f,\"h\":%d,\"s\":%d,\"f\":%d,\"ft\":\"%s\","
     "\"sn\":\"%s\",\"ok\":%d,\"w\":\"%s\",\"mq\":\"%s\",\"oled\":%d,"
@@ -752,7 +746,7 @@ void sendTelemetry() {
     temp_valid ? temp_f : 0.0f, target_temp, output_power, is_heating ? 1 : 0, ssr_on ? 1 : 0,
     fault, FAULT_NAMES[fault], SENSOR_NAMES[sensor], temp_valid ? 1 : 0,
     temp_valid ? "" : SS_NAMES[sensor_st], mqStatus(), oled_ok ? 1 : 0,
-    w_ok ? 1 : 0, w_ok ? WiFi.SSID().c_str() : "", w_ok ? WiFi.localIP().toString().c_str() : "",
+    w_ok ? 1 : 0, safe_ssid.c_str(), w_ok ? WiFi.localIP().toString().c_str() : "",
     profile.name, PHASE_NAMES[profile.current_phase],
     (standby_state == STBY_STANDBY) ? 1 : 0,
     fan_active ? 1 : 0,
@@ -760,7 +754,6 @@ void sendTelemetry() {
     tune_cycles);
   ws.textAll(buf);
 
-  // Пакет 2: Статистика и счетчики (Компактный легкий JSON)
   char sbuf[192];
   snprintf(sbuf, sizeof(sbuf),
     "{\"type\":\"stat\",\"wh\":%.2f,\"s_sec\":%u,\"r_cyc\":%u,\"tot_m\":%u}",
@@ -768,28 +761,41 @@ void sendTelemetry() {
   ws.textAll(sbuf);
 }
 
-void performWifiScan(AsyncWebSocketClient *c) {
-  int n = WiFi.scanNetworks();
-  DynamicJsonDocument doc(1536);
-  doc["type"] = "scan";
-  JsonArray arr = doc.createNestedArray("list");
-  for (int i = 0; i < n; ++i) {
-    JsonObject obj = arr.createNestedObject();
-    obj["s"] = WiFi.SSID(i);
-    int q = 2 * (WiFi.RSSI(i) + 100);
-    obj["r"] = constrain(q, 0, 100);
+// ИСПРАВЛЕНИЕ: Асинхронное сканирование Wi-Fi (не блокирует процессор)
+void triggerAsyncWifiScan() {
+  if (!wifi_scan_running) {
+    wifi_scan_running = true;
+    WiFi.scanNetworks(true); // Асинхронно!
   }
-  String out;
-  serializeJson(doc, out);
-  c->text(out);
+}
+
+void checkWifiScanResults() {
+  if (!wifi_scan_running) return;
+  int n = WiFi.scanComplete();
+  if (n >= 0) {
+    wifi_scan_running = false;
+    DynamicJsonDocument doc(1536);
+    doc["type"] = "scan";
+    JsonArray arr = doc.createNestedArray("list");
+    for (int i = 0; i < n; ++i) {
+      JsonObject obj = arr.createNestedObject();
+      obj["s"] = WiFi.SSID(i);
+      int q = 2 * (WiFi.RSSI(i) + 100);
+      obj["r"] = constrain(q, 0, 100);
+    }
+    String out;
+    serializeJson(doc, out);
+    ws.textAll(out);
+    WiFi.scanDelete();
+  }
 }
 
 void handleCommand(AsyncWebSocketClient *c, JsonDocument &d) {
   if (web_pin[0] && strcmp(d["pin"] | "", web_pin) != 0) { c->text("{\"type\":\"denied\"}"); return; }
   const char *a = d["a"] | "";
-  resetActivityTimer(); // Команда из Web будит столик!
+  resetActivityTimer();
 
- if (!strcmp(a, "set_stby")) {
+  if (!strcmp(a, "set_stby")) {
     standby_timeout_min = d["m"] | 10;
     cfg_save = true;
   } else if (!strcmp(a, "reset_stats")) {
@@ -798,7 +804,7 @@ void handleCommand(AsyncWebSocketClient *c, JsonDocument &d) {
     if (d["all"] | false) {
       lifetime_heat_min = 0;
       reflow_cycles_count = 0;
-      cfg_save = true; // Записываем обнуление в флеш
+      cfg_save = true;
     }
     buzzer.play(SND_CLICK);
     forceTele = true;
@@ -822,18 +828,33 @@ void handleCommand(AsyncWebSocketClient *c, JsonDocument &d) {
       startHeating();
     }
   } else if (!strcmp(a, "save_prof")) {
+    // ИСПРАВЛЕНИЕ: Жесткая валидация параметров профиля
     uint8_t idx = d["idx"] | 0;
-    if (idx < 4) {
-      strlcpy(profile.list[idx].name, d["name"] | "Prof", sizeof(profile.list[idx].name));
+    int pre = d["pre"] | 150;
+    int soak = d["soak"] | 165;
+    int soak_t = d["soak_t"] | 60;
+    int ref = d["ref"] | 215;
+    int ref_t = d["ref_t"] | 25;
+    const char* p_name = d["name"] | "Prof";
+
+    if (idx < 4 && strlen(p_name) > 0 &&
+        pre >= 50 && pre <= 200 &&
+        soak >= (pre + 5) && soak <= 220 &&
+        soak_t >= 10 && soak_t <= 300 &&
+        ref >= (soak + 5) && ref <= (int)(limitTemp() - TARGET_MARGIN) &&
+        ref_t >= 5 && ref_t <= 120) {
+      strlcpy(profile.list[idx].name, p_name, sizeof(profile.list[idx].name));
       strlcpy(profile.list[idx].desc, d["desc"] | "", sizeof(profile.list[idx].desc));
-      profile.list[idx].preheat  = d["pre"] | 150;
-      profile.list[idx].soak     = d["soak"] | 165;
-      profile.list[idx].soak_t   = d["soak_t"] | 60;
-      profile.list[idx].reflow   = d["ref"] | 215;
-      profile.list[idx].reflow_t = d["ref_t"] | 25;
+      profile.list[idx].preheat  = pre;
+      profile.list[idx].soak     = soak;
+      profile.list[idx].soak_t   = soak_t;
+      profile.list[idx].reflow   = ref;
+      profile.list[idx].reflow_t = ref_t;
       saveProfiles();
       buzzer.play(SND_CLICK);
       forceTele = true;
+    } else {
+      buzzer.play(SND_FAULT); // Ошибка валидации
     }
   } else if (!strcmp(a, "target")) {
     if (profile.is_active) stopHeating();
@@ -845,7 +866,7 @@ void handleCommand(AsyncWebSocketClient *c, JsonDocument &d) {
     fault = F_NONE;
     buzzer.play(SND_CLICK);
   } else if (!strcmp(a, "scan")) {
-    performWifiScan(c);
+    triggerAsyncWifiScan();
   } else if (!strcmp(a, "sensor")) {
     const char *v = d["v"] | "auto";
     for (uint8_t i = 0; i < 4; i++) if (!strcmp(v, CFG_NAMES[i])) cfg_sensor = i;
@@ -898,7 +919,6 @@ void handleMQTT(uint32_t now) {
     static uint32_t last_try = 0;
     if (now - last_try < 10000) return;
     last_try = now;
-    digitalWrite(PIN_SSR, LOW);
     char cid[32], will[80];
     snprintf(cid, sizeof(cid), "ReflowPlate-%06x", (unsigned)ESP.getChipId());
     snprintf(will, sizeof(will), "%s/status", mqtt_topic);
@@ -944,14 +964,13 @@ void setupWifi() {
     WiFi.mode(WIFI_STA);
     Serial.printf("[NET] SUCCESS! Connected. IP: %s (AP DISABLED)\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.println("[NET] Router connection failed! Starting AP mode...");
+    Serial.println(F("[NET] Router connection failed! Starting AP mode..."));
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
     WiFi.enableAP(true);
     Serial.printf("[NET] AP SSID: %s (IP: 192.168.4.1)\n", AP_SSID);
   }
 }
-
 
 void setup() {
   pinMode(PIN_SSR, OUTPUT);
@@ -962,7 +981,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   loadConfig();
-  loadProfiles(); // Загружаем profiles.json из LittleFS
+  loadProfiles();
 
   pinMode(PIN_MAX_CS, OUTPUT);  digitalWrite(PIN_MAX_CS, HIGH);
   pinMode(PIN_MAX_SCK, OUTPUT); digitalWrite(PIN_MAX_SCK, LOW);
@@ -983,8 +1002,8 @@ void setup() {
   applySensor();
   setupWifi();
 
-  espClient.setTimeout(2000);
-  mqttClient.setSocketTimeout(2);
+  espClient.setTimeout(1000);
+  mqttClient.setSocketTimeout(1);
   mqttClient.setBufferSize(512);
 
   ws.onEvent(onWsEvent);
@@ -995,11 +1014,18 @@ void setup() {
     r->send(response);
   });
 
-  // OTA
+  // ИСПРАВЛЕНИЕ: Проверка PIN-кода на /update эндпоинте
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (web_pin[0] && (!request->hasHeader("X-PIN") || request->header("X-PIN") != web_pin)) {
+      request->send(403, "text/plain", "FORBIDDEN: Wrong PIN");
+      return;
+    }
     request->send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
     restart_at = millis() + 1000;
   }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    if (web_pin[0] && (!request->hasHeader("X-PIN") || request->header("X-PIN") != web_pin)) {
+      return;
+    }
     if (!index) {
       stopHeating();
       Update.runAsync(true);
@@ -1022,6 +1048,7 @@ void loop() {
   ws.cleanupClients();
 
   buzzer.tick(now);
+  checkWifiScanResults(); // Проверка асинхронного скана сетей
 
   if (cfg_save)     { cfg_save = false; saveConfig(); }
   if (apply_sensor) { apply_sensor = false; applySensor(); }
@@ -1033,34 +1060,28 @@ void loop() {
     controlTick(now);
     if (!oled_ok && now - oled_probe > 10000) { oled_probe = now; oled_ok = initOled(); }
 
-    // Авто-гашение экрана через 15 минут бездействия (когда ТЭН выключен и остыл)
     if (!is_heating && !oled_sleeping && (now - last_activity_time > 15UL * 60UL * 1000UL)) {
       if (oled_ok) {
-        display.ssd1306_command(SSD1306_DISPLAYOFF); // Физически гасим матрицу дисплея
+        display.ssd1306_command(SSD1306_DISPLAYOFF);
         oled_sleeping = true;
       }
     }
 
-    // Рисуем на экране только если он не спит
     if (!oled_sleeping) {
       drawOled();
     }
   }
   updateSSR(now);
 
-  // Интегратор энергопотребления (каждые 1000 мс)
   if (now - last_energy_calc >= 1000) {
     last_energy_calc = now;
     if (is_heating && fault == F_NONE) {
       session_heat_sec++;
-      // Энергия (Wh) = Мощность(W) * (Power%/100) * (1 сек / 3600 сек в часе)
       float current_watts = HEATER_RATED_WATTS * (output_power / 100.0f);
       session_wh += current_watts / 3600.0f;
 
-      // Каждые 60 секунд работы ТЭНа увеличиваем общий счетчик моточасов
       if (session_heat_sec % 60 == 0) {
         lifetime_heat_min++;
-        // Сохраняем в память каждые 30 минут работы
         if (lifetime_heat_min % 30 == 0) cfg_save = true;
       }
     }
