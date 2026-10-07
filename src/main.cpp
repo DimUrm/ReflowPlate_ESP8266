@@ -772,7 +772,10 @@ void triggerAsyncWifiScan() {
 void checkWifiScanResults() {
   if (!wifi_scan_running) return;
   int n = WiFi.scanComplete();
-  if (n >= 0) {
+  if (n == WIFI_SCAN_FAILED) {
+    wifi_scan_running = false; // Сброс при сбое скана
+  }
+  else if (n >= 0) {
     wifi_scan_running = false;
     DynamicJsonDocument doc(1536);
     doc["type"] = "scan";
@@ -1014,16 +1017,17 @@ void setup() {
     r->send(response);
   });
 
-  // ИСПРАВЛЕНИЕ: Проверка PIN-кода на /update эндпоинте
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (web_pin[0] && (!request->hasHeader("X-PIN") || request->header("X-PIN") != web_pin)) {
+    AsyncWebHeader* h = request->getHeader("X-PIN");
+    if (web_pin[0] && (!h || h->value() != web_pin)) {
       request->send(403, "text/plain", "FORBIDDEN: Wrong PIN");
       return;
     }
     request->send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
     restart_at = millis() + 1000;
   }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-    if (web_pin[0] && (!request->hasHeader("X-PIN") || request->header("X-PIN") != web_pin)) {
+    AsyncWebHeader* h = request->getHeader("X-PIN");
+    if (web_pin[0] && (!h || h->value() != web_pin)) {
       return;
     }
     if (!index) {
