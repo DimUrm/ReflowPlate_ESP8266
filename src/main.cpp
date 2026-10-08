@@ -655,7 +655,7 @@ void drawOled() {
 
   display.drawFastHLine(0, 11, 128, SSD1306_WHITE);
 
-  char status_str[24];
+  char status_str[36];
   if (fault != F_NONE) {
     snprintf(status_str, sizeof(status_str), "FAULT: %s", FAULT_NAMES[fault]);
   } else if (tune_state == TUNE_RUNNING) {
@@ -1038,7 +1038,7 @@ void setup() {
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
-    AsyncWebServerResponse *response = r->beginResponse_P(200, "text/html", index_html_gz, index_html_gz_len);
+    AsyncWebServerResponse *response = r->beginResponse(200, "text/html", index_html_gz, index_html_gz_len);
     response->addHeader("Content-Encoding", "gzip");
     r->send(response);
   });
