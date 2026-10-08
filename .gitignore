@@ -6,7 +6,7 @@
 .vscode/ipch/
 
 # Сгенерированные релизы и временные файлы
-version.txt
+#version.txt
 changes.txt
 releases/*.bin
 

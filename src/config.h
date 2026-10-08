@@ -27,6 +27,9 @@ static const uint32_t WINDOW_MS     = 1000;
 static const uint32_t HEAT_MAX_MS   = 60UL * 60UL * 1000UL;
 static const uint32_t NO_RISE_MS    = 60000UL;
 static const float    NO_RISE_DT    = 3.0f;
+// --- Паузы подключения к MQTT-брокеру (v2.4.23) ---
+static const uint32_t MQTT_RETRY_MIN_MS = 10000UL;   // пауза между попытками подключения
+static const uint32_t MQTT_RETRY_MAX_MS = 120000UL;  // максимум паузы (удваивается после каждой неудачи)
 static const float    I_ZONE        = 10.0f;
 
 static const float    NTC_R_FIXED   = 100000.0f, NTC_R0 = 100000.0f, NTC_BETA = 3950.0f;

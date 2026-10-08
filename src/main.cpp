@@ -146,6 +146,16 @@ void resetActivityTimer() {
 }
 
 // ================= ФАЙЛ PROFILES.JSON =================
+// Убираем из текста символы, ломающие JSON и HTML: " ' \ < > & и управляющие
+static void cleanText(char* s) {
+  char* w = s;
+  for (char* r = s; *r; r++) {
+    unsigned char c = (unsigned char)*r;
+    if (c < 0x20 || c == '"' || c == '\'' || c == '\\' || c == '<' || c == '>' || c == '&') continue;
+    *w++ = *r;
+  }
+  *w = 0;
+}
 void createDefaultProfiles() {
   File f = LittleFS.open("/profiles.json", "w");
   if (!f) return;
@@ -186,6 +196,9 @@ void loadProfiles() {
     profile.list[i].soak_t   = obj["soak_t"] | 60;
     profile.list[i].reflow   = obj["ref"] | 215.0f;
     profile.list[i].reflow_t = obj["ref_t"] | 25;
+    cleanText(profile.list[i].name);                    // имена из файла тоже чистим
+    cleanText(profile.list[i].desc);
+    if (!profile.list[i].name[0]) strlcpy(profile.list[i].name, "Prof", sizeof(profile.list[i].name));
   }
   Serial.println(F("[FS] 4 Profiles loaded from /profiles.json"));
 }
@@ -384,9 +397,11 @@ void runAutoTune(uint32_t now) {
 
       // ИСПРАВЛЕНИЕ: d = 50% амплитуды реле, числитель 200 вместо 400!
       float ku = (4.0f * 50.0f) / (3.14159265f * a);
-      Kp = 0.6f * ku;
-      Ki = 1.2f * ku / pu;
-      Kd = 0.075f * ku * pu;
+      // Осторожное правило вместо классического Циглера-Никольса (проверено на 4 моделях плиты: перелёт <= 2.2°C,
+      // классика давала +5...+9°C): Kp = 0.125*Ku, Ti = 2.8*Pu, Td = 0.35*Pu
+      Kp = 0.125f * ku;
+      Ki = Kp / (2.8f * pu);
+      Kd = Kp * (0.35f * pu);
 
       Kp = constrain(Kp, 0.5f, 50.0f);
       Ki = constrain(Ki, 0.001f, 1.0f);
@@ -737,6 +752,7 @@ void sendTelemetry() {
   
   // ИСПРАВЛЕНИЕ: Экранируем кавычки в имени SSID
   String safe_ssid = w_ok ? WiFi.SSID() : "";
+  safe_ssid.replace("\\", "\\\\");   // сначала обратная косая (иначе a\b превращается в a<backspace>)
   safe_ssid.replace("\"", "\\\"");
 
   snprintf(buf, sizeof(buf),
@@ -848,6 +864,9 @@ void handleCommand(AsyncWebSocketClient *c, JsonDocument &d) {
         ref_t >= 5 && ref_t <= 120) {
       strlcpy(profile.list[idx].name, p_name, sizeof(profile.list[idx].name));
       strlcpy(profile.list[idx].desc, d["desc"] | "", sizeof(profile.list[idx].desc));
+      cleanText(profile.list[idx].name);                // убираем " ' \ < > & и управляющие символы
+      cleanText(profile.list[idx].desc);
+      if (!profile.list[idx].name[0]) strlcpy(profile.list[idx].name, "Prof", sizeof(profile.list[idx].name));
       profile.list[idx].preheat  = pre;
       profile.list[idx].soak     = soak;
       profile.list[idx].soak_t   = soak_t;
@@ -859,6 +878,7 @@ void handleCommand(AsyncWebSocketClient *c, JsonDocument &d) {
     } else {
       buzzer.play(SND_FAULT); // Ошибка валидации
     }
+    sendConfig(c);   // браузер получает реальные значения (при отказе интерфейс не должен показывать несохранённые)
   } else if (!strcmp(a, "target")) {
     if (profile.is_active) stopHeating();
     setTarget(d["v"] | target_temp);
@@ -910,23 +930,29 @@ void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *client, AwsEventType typ
   }
 }
 
+static uint32_t mqtt_last_try = 0, mqtt_retry_ms = MQTT_RETRY_MIN_MS;   // состояние попыток подключения к брокеру
 void handleMQTT(uint32_t now) {
   if (mqtt_reconf) {
     mqtt_reconf = false;
     if (mqttClient.connected()) mqttClient.disconnect();
     mqttClient.setServer(mqtt_server, mqtt_port);
+    mqtt_last_try = 0; mqtt_retry_ms = MQTT_RETRY_MIN_MS;     // новые настройки — пробуем сразу
   }
   if (!mqtt_enabled || WiFi.status() != WL_CONNECTED) return;
 
   if (!mqttClient.connected()) {
-    static uint32_t last_try = 0;
-    if (now - last_try < 10000) return;
-    last_try = now;
+    if (now - mqtt_last_try < mqtt_retry_ms) return;
+    // connect() блокирует loop() на время таймаута: во время профиля и автотюна не пытаемся совсем
+    if (profile.is_active || tune_state == TUNE_RUNNING) return;
+    mqtt_last_try = now;
     char cid[32], will[80];
     snprintf(cid, sizeof(cid), "ReflowPlate-%06x", (unsigned)ESP.getChipId());
     snprintf(will, sizeof(will), "%s/status", mqtt_topic);
     if (mqttClient.connect(cid, mqtt_user[0] ? mqtt_user : NULL, mqtt_pass[0] ? mqtt_pass : NULL, will, 0, true, "offline")) {
       mqttClient.publish(will, "online", true);
+      mqtt_retry_ms = MQTT_RETRY_MIN_MS;
+    } else {
+      mqtt_retry_ms = (mqtt_retry_ms * 2 > MQTT_RETRY_MAX_MS) ? MQTT_RETRY_MAX_MS : mqtt_retry_ms * 2;   // экспоненциальная пауза
     }
     return;
   }
@@ -1018,7 +1044,7 @@ void setup() {
   });
 
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request) {
-    AsyncWebHeader* h = request->getHeader("X-PIN");
+    const AsyncWebHeader* h = request->getHeader("X-PIN");
     if (web_pin[0] && (!h || h->value() != web_pin)) {
       request->send(403, "text/plain", "FORBIDDEN: Wrong PIN");
       return;
@@ -1026,7 +1052,7 @@ void setup() {
     request->send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
     restart_at = millis() + 1000;
   }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-    AsyncWebHeader* h = request->getHeader("X-PIN");
+    const AsyncWebHeader* h = request->getHeader("X-PIN");
     if (web_pin[0] && (!h || h->value() != web_pin)) {
       return;
     }
@@ -1064,7 +1090,8 @@ void loop() {
     controlTick(now);
     if (!oled_ok && now - oled_probe > 10000) { oled_probe = now; oled_ok = initOled(); }
 
-    if (!is_heating && !oled_sleeping && (now - last_activity_time > 15UL * 60UL * 1000UL)) {
+    if (!is_heating && !profile.is_active && temp_f < 50.0f && !oled_sleeping &&
+        (now - last_activity_time > 15UL * 60UL * 1000UL)) {      // не гасим экран над горячей плитой и во время профиля
       if (oled_ok) {
         display.ssd1306_command(SSD1306_DISPLAYOFF);
         oled_sleeping = true;
